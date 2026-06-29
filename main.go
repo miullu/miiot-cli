@@ -104,6 +104,10 @@ func miioSetPower(dev *Device, state string) ([]interface{}, error) {
 	return resp.Result, nil
 }
 
+func newDevice(host, token string) (*Device, error) {
+	return NewDevice(host, token, 5*time.Second)
+}
+
 func detectProtocol(dev *Device, model, did string) string {
 	protos := loadProtocols()
 	if p, ok := protos[model]; ok {
@@ -485,68 +489,34 @@ func cmdColortemp(dev *Device, rawValue string) int {
 	return cmdSetProp(dev, "colortemp", rawValue, "colortemp")
 }
 
-func usage() {
-	fmt.Fprintf(os.Stderr, `miiot-cli: Control Xiaomi MIoT/miIO devices locally.
-
-Usage:
-  miiot-cli <host> <token> info               - Get device info
-  miiot-cli <host> <token> on                 - Turn light on
-  miiot-cli <host> <token> off                - Turn light off
-  miiot-cli <host> <token> status             - Get power status
-  miiot-cli <host> <token> detect             - Detect MIoT vs miIO protocol
-  miiot-cli <host> <token> spec               - Fetch and cache MIoT spec
-  miiot-cli <host> <token> get <prop>         - Read a property (e.g. power,brightness)
-  miiot-cli <host> <token> set <prop> <value> - Set a property
-  miiot-cli <host> <token> brightness <val>   - Set brightness (0-100)
-  miiot-cli <host> <token> mode <val>         - Set mode (e.g. 0=day,1=night)
-  miiot-cli <host> <token> colortemp <val>    - Set color temperature (kelvin)
-
-`)
-}
-
-func main() {
-	if len(os.Args) < 3 {
-		usage()
-		os.Exit(1)
+func runWithDevice(host, token string, args []string, force bool) int {
+	dev, err := newDevice(host, token)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
+		return 1
 	}
-
-	host := os.Args[1]
-	token := os.Args[2]
 
 	command := "status"
-	if len(os.Args) >= 4 {
-		command = os.Args[3]
-	}
-
-	force := false
-	for i, arg := range os.Args {
-		if arg == "--force" {
-			force = true
-			os.Args = append(os.Args[:i], os.Args[i+1:]...)
-			break
-		}
+	if len(args) > 0 {
+		command = args[0]
 	}
 
 	needsValue := map[string]int{
-		"get": 5, "set": 6,
-		"brightness": 5, "mode": 5, "colortemp": 5,
-	}
-	isValueCmd := map[string]bool{
-		"brightness": true, "mode": true, "colortemp": true,
+		"get": 1, "set": 2,
+		"brightness": 1, "mode": 1, "colortemp": 1,
 	}
 
 	if minArgs, needs := needsValue[command]; needs {
-		if len(os.Args) < minArgs {
-			name := command
-			if isValueCmd[command] {
-				fmt.Fprintf(os.Stderr, "Error: %s requires a value\n", name)
-			} else if command == "get" {
+		if len(args) < minArgs+1 {
+			switch command {
+			case "get":
 				fmt.Fprintln(os.Stderr, "Error: get requires a property name")
-			} else {
+			case "set":
 				fmt.Fprintln(os.Stderr, "Error: set requires a property name and value")
+			default:
+				fmt.Fprintf(os.Stderr, "Error: %s requires a value\n", command)
 			}
-			usage()
-			os.Exit(1)
+			return 1
 		}
 	}
 
@@ -555,40 +525,162 @@ func main() {
 		"brightness", "mode", "colortemp":
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
+		return 1
+	}
+
+	switch command {
+	case "info":
+		return cmdInfo(dev)
+	case "detect":
+		return cmdDetect(dev)
+	case "on":
+		return cmdOn(dev)
+	case "off":
+		return cmdOff(dev)
+	case "status":
+		return cmdStatus(dev)
+	case "spec":
+		return cmdSpec(dev, force)
+	case "get":
+		return cmdGet(dev, args[1])
+	case "set":
+		return cmdSet(dev, args[1], args[2])
+	case "brightness":
+		return cmdBrightness(dev, args[1])
+	case "mode":
+		return cmdMode(dev, args[1])
+	case "colortemp":
+		return cmdColortemp(dev, args[1])
+	}
+	return 0
+}
+
+func usage() {
+	fmt.Fprintf(os.Stderr, `miiot-cli: Control Xiaomi MIoT/miIO devices locally.
+
+Usage:
+  miiot-cli list                          - List stored devices
+  miiot-cli add <name> <host> <token>     - Add a device
+  miiot-cli remove <name>                 - Remove a device
+  miiot-cli <name> info                   - Get device info
+  miiot-cli <name> on                     - Turn light on
+  miiot-cli <name> off                    - Turn light off
+  miiot-cli <name> status                 - Get power status
+  miiot-cli <name> detect                 - Detect MIoT vs miIO protocol
+  miiot-cli <name> spec                   - Fetch and cache MIoT spec
+  miiot-cli <name> get <prop>             - Read a property (e.g. power,brightness)
+  miiot-cli <name> set <prop> <value>     - Set a property
+  miiot-cli <name> brightness <val>       - Set brightness (0-100)
+  miiot-cli <name> mode <val>             - Set mode (e.g. 0=day,1=night)
+  miiot-cli <name> colortemp <val>        - Set color temperature (kelvin)
+  miiot-cli serve [--port <port>]         - Start web dashboard (default :8080)
+
+Legacy (direct IP/token, no CSV):
+  miiot-cli <host> <token> <command> [args...]
+
+Environment:
+  MIIOT_CLI_PATH    Data directory (devices.csv, spec cache, etc.)
+                    Default: ~/.cache/miiot-cli
+`)
+}
+
+func cmdList() int {
+	devices, err := LoadDevices()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error loading devices:", err)
+		return 1
+	}
+	if len(devices) == 0 {
+		fmt.Println("No devices stored.")
+		fmt.Println("Use: miiot-cli add <name> <host> <token>")
+		return 0
+	}
+	fmt.Printf("%-20s %-21s %-32s\n", "Name", "IP", "Token")
+	fmt.Println(strings.Repeat("-", 75))
+	for _, d := range devices {
+		tok := d.Token
+		if len(tok) > 8 {
+			tok = tok[:4] + "..." + tok[len(tok)-4:]
+		}
+		fmt.Printf("%-20s %-21s %-32s\n", d.Name, d.Host, tok)
+	}
+	return 0
+}
+
+func main() {
+	if len(os.Args) < 2 {
 		usage()
 		os.Exit(1)
 	}
 
-	dev, err := NewDevice(host, token, 5*time.Second)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "Error:", err)
-		os.Exit(1)
+	force := false
+	var cleanArgs []string
+	for _, arg := range os.Args[1:] {
+		if arg == "--force" {
+			force = true
+		} else {
+			cleanArgs = append(cleanArgs, arg)
+		}
 	}
 
-	var exitCode int
-	switch command {
-	case "info":
-		exitCode = cmdInfo(dev)
-	case "detect":
-		exitCode = cmdDetect(dev)
-	case "on":
-		exitCode = cmdOn(dev)
-	case "off":
-		exitCode = cmdOff(dev)
-	case "status":
-		exitCode = cmdStatus(dev)
-	case "spec":
-		exitCode = cmdSpec(dev, force)
-	case "get":
-		exitCode = cmdGet(dev, os.Args[4])
-	case "set":
-		exitCode = cmdSet(dev, os.Args[4], os.Args[5])
-	case "brightness":
-		exitCode = cmdBrightness(dev, os.Args[4])
-	case "mode":
-		exitCode = cmdMode(dev, os.Args[4])
-	case "colortemp":
-		exitCode = cmdColortemp(dev, os.Args[4])
+	first := cleanArgs[0]
+
+	switch first {
+	case "help", "--help", "-h":
+		usage()
+		return
+
+	case "list":
+		os.Exit(cmdList())
+
+	case "add":
+		if len(cleanArgs) < 4 {
+			fmt.Fprintln(os.Stderr, "Usage: miiot-cli add <name> <host> <token>")
+			os.Exit(1)
+		}
+		if err := AddDevice(cleanArgs[1], cleanArgs[2], cleanArgs[3]); err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Device '%s' added.\n", cleanArgs[1])
+
+	case "remove":
+		if len(cleanArgs) < 2 {
+			fmt.Fprintln(os.Stderr, "Usage: miiot-cli remove <name>")
+			os.Exit(1)
+		}
+		if err := RemoveDevice(cleanArgs[1]); err != nil {
+			fmt.Fprintln(os.Stderr, "Error:", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Device '%s' removed.\n", cleanArgs[1])
+
+	case "serve":
+		port := ":8080"
+		for i, arg := range cleanArgs {
+			if arg == "--port" && i+1 < len(cleanArgs) {
+				port = ":" + cleanArgs[i+1]
+			}
+		}
+		fmt.Printf("Starting web server on %s\n", port)
+		if err := serveWeb(port); err != nil {
+			fmt.Fprintln(os.Stderr, "Server error:", err)
+			os.Exit(1)
+		}
+
+	default:
+		if entry, err := FindDevice(first); err == nil {
+			os.Exit(runWithDevice(entry.Host, entry.Token, cleanArgs[1:], force))
+			return
+		}
+
+		if len(cleanArgs) >= 2 {
+			os.Exit(runWithDevice(cleanArgs[0], cleanArgs[1], cleanArgs[2:], force))
+			return
+		}
+
+		fmt.Fprintf(os.Stderr, "Unknown command or device: %s\n", first)
+		usage()
+		os.Exit(1)
 	}
-	os.Exit(exitCode)
 }

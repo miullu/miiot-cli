@@ -12,7 +12,6 @@ import (
 )
 
 const (
-	cacheDir   = ".cache/miiot-cli"
 	specSubdir = "specs"
 	protoFile  = "protocols.json"
 
@@ -49,27 +48,12 @@ type MiotProperty struct {
 	Access []string `json:"access,omitempty"`
 }
 
-func cacheBaseDir() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(home, cacheDir), nil
-}
-
-func specCacheDir() (string, error) {
-	base, err := cacheBaseDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(base, specSubdir), nil
+func specCacheDir() string {
+	return filepath.Join(dataDir(), specSubdir)
 }
 
 func specCachePath(model string) (string, error) {
-	dir, err := specCacheDir()
-	if err != nil {
-		return "", err
-	}
+	dir := specCacheDir()
 	name := strings.ReplaceAll(model, "/", "_") + ".json"
 	return filepath.Join(dir, name), nil
 }
@@ -91,10 +75,7 @@ func loadCachedSpec(model string) (*MiotSpec, error) {
 }
 
 func saveSpecToCache(model string, spec *MiotSpec) error {
-	dir, err := specCacheDir()
-	if err != nil {
-		return err
-	}
+	dir := specCacheDir()
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return err
 	}
@@ -180,11 +161,7 @@ func getSpec(model string, force bool) (*MiotSpec, error) {
 }
 
 func loadProtocols() map[string]string {
-	base, err := cacheBaseDir()
-	if err != nil {
-		return nil
-	}
-	path := filepath.Join(base, protoFile)
+	path := filepath.Join(dataDir(), protoFile)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil
@@ -197,10 +174,7 @@ func loadProtocols() map[string]string {
 }
 
 func saveProtocol(model, proto string) {
-	base, err := cacheBaseDir()
-	if err != nil {
-		return
-	}
+	base := dataDir()
 	if err := os.MkdirAll(base, 0755); err != nil {
 		return
 	}

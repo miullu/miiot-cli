@@ -581,6 +581,7 @@ Legacy (direct IP/token, no CSV):
 Environment:
   MIIOT_CLI_PATH    Data directory (devices.csv, spec cache, etc.)
                     Default: ~/.cache/miiot-cli
+  MIIOT_CLI_WEB     Path to custom HTML dashboard file (served instead of built-in)
 `)
 }
 

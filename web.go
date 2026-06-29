@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -300,6 +301,10 @@ func serveWeb(port string) error {
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if webPath := os.Getenv("MIIOT_CLI_WEB"); webPath != "" {
+			http.ServeFile(w, r, webPath)
+			return
+		}
 		dashboardTmpl.Execute(w, nil)
 	})
 

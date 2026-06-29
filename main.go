@@ -394,7 +394,7 @@ func cmdGet(dev *Device, propName string) int {
 	return 1
 }
 
-func cmdSet(dev *Device, propName, rawValue string) int {
+func cmdSetProp(dev *Device, propName, rawValue, displayName string) int {
 	pi, err := getInfo(dev)
 	if err != nil {
 		fmt.Println("Failed to get device info:", err)
@@ -403,6 +403,8 @@ func cmdSet(dev *Device, propName, rawValue string) int {
 
 	var value interface{}
 	if v, err := strconv.Atoi(rawValue); err == nil {
+		value = v
+	} else if v, err := strconv.ParseFloat(rawValue, 64); err == nil {
 		value = v
 	} else {
 		low := strings.ToLower(rawValue)
@@ -431,7 +433,7 @@ func cmdSet(dev *Device, propName, rawValue string) int {
 		}
 		_, err = miotSetProperty(dev, pi.did, siid, piid, value)
 		if err == nil {
-			fmt.Printf("%s set to %v\n", propName, value)
+			fmt.Printf("%s set to %v\n", displayName, value)
 			return 0
 		}
 	} else if proto == "miio" && propName == "power" {
@@ -457,28 +459,48 @@ func cmdSet(dev *Device, propName, rawValue string) int {
 				Result []interface{} `json:"result"`
 			}
 			if json.Unmarshal(raw, &resp) == nil {
-				fmt.Printf("%s set to %v\n", propName, value)
+				fmt.Printf("%s set to %v\n", displayName, value)
 				return 0
 			}
 		}
 	}
 
-	fmt.Printf("Failed to set %s\n", propName)
+	fmt.Printf("Failed to set %s\n", displayName)
 	return 1
+}
+
+func cmdSet(dev *Device, propName, rawValue string) int {
+	return cmdSetProp(dev, propName, rawValue, propName)
+}
+
+func cmdBrightness(dev *Device, rawValue string) int {
+	return cmdSetProp(dev, "brightness", rawValue, "brightness")
+}
+
+func cmdMode(dev *Device, rawValue string) int {
+	return cmdSetProp(dev, "mode", rawValue, "mode")
+}
+
+func cmdColortemp(dev *Device, rawValue string) int {
+	return cmdSetProp(dev, "colortemp", rawValue, "colortemp")
 }
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `miiot-cli: Control Xiaomi MIoT/miIO devices locally.
 
 Usage:
-  miiot-cli <host> <token> info        - Get device info
-  miiot-cli <host> <token> on          - Turn light on
-  miiot-cli <host> <token> off         - Turn light off
-  miiot-cli <host> <token> status      - Get power status
-  miiot-cli <host> <token> detect      - Detect MIoT vs miIO protocol
-  miiot-cli <host> <token> spec        - Fetch and cache MIoT spec
-  miiot-cli <host> <token> get <prop>  - Read a property (e.g. power,brightness)
-  miiot-cli <host> <token> set <prop> <value>  - Set a property
+  miiot-cli <host> <token> info               - Get device info
+  miiot-cli <host> <token> on                 - Turn light on
+  miiot-cli <host> <token> off                - Turn light off
+  miiot-cli <host> <token> status             - Get power status
+  miiot-cli <host> <token> detect             - Detect MIoT vs miIO protocol
+  miiot-cli <host> <token> spec               - Fetch and cache MIoT spec
+  miiot-cli <host> <token> get <prop>         - Read a property (e.g. power,brightness)
+  miiot-cli <host> <token> set <prop> <value> - Set a property
+  miiot-cli <host> <token> brightness <val>   - Set brightness (0-100)
+  miiot-cli <host> <token> mode <val>         - Set mode (e.g. 0=day,1=night)
+  miiot-cli <host> <token> colortemp <val>    - Set color temperature (kelvin)
+
 `)
 }
 
@@ -505,23 +527,34 @@ func main() {
 		}
 	}
 
-	validCmds := map[string]bool{
-		"info": true, "on": true, "off": true, "status": true,
-		"detect": true, "spec": true, "get": true, "set": true,
+	needsValue := map[string]int{
+		"get": 5, "set": 6,
+		"brightness": 5, "mode": 5, "colortemp": 5,
 	}
-	if !validCmds[command] {
-		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
-		usage()
-		os.Exit(1)
+	isValueCmd := map[string]bool{
+		"brightness": true, "mode": true, "colortemp": true,
 	}
 
-	if command == "get" && len(os.Args) < 5 {
-		fmt.Fprintln(os.Stderr, "Error: get requires a property name")
-		usage()
-		os.Exit(1)
+	if minArgs, needs := needsValue[command]; needs {
+		if len(os.Args) < minArgs {
+			name := command
+			if isValueCmd[command] {
+				fmt.Fprintf(os.Stderr, "Error: %s requires a value\n", name)
+			} else if command == "get" {
+				fmt.Fprintln(os.Stderr, "Error: get requires a property name")
+			} else {
+				fmt.Fprintln(os.Stderr, "Error: set requires a property name and value")
+			}
+			usage()
+			os.Exit(1)
+		}
 	}
-	if command == "set" && len(os.Args) < 6 {
-		fmt.Fprintln(os.Stderr, "Error: set requires a property name and value")
+
+	switch command {
+	case "info", "on", "off", "status", "detect", "spec", "get", "set",
+		"brightness", "mode", "colortemp":
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown command: %s\n", command)
 		usage()
 		os.Exit(1)
 	}
@@ -550,6 +583,12 @@ func main() {
 		exitCode = cmdGet(dev, os.Args[4])
 	case "set":
 		exitCode = cmdSet(dev, os.Args[4], os.Args[5])
+	case "brightness":
+		exitCode = cmdBrightness(dev, os.Args[4])
+	case "mode":
+		exitCode = cmdMode(dev, os.Args[4])
+	case "colortemp":
+		exitCode = cmdColortemp(dev, os.Args[4])
 	}
 	os.Exit(exitCode)
 }

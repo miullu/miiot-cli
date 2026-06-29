@@ -233,16 +233,31 @@ func findLightOnProp(spec *MiotSpec) (siid, piid int, ok bool) {
 	return 0, 0, false
 }
 
+var propAliases = map[string][]string{
+	"colortemp":    {"color-temperature", "color_temp", "colour_temperature"},
+	"color_temp":   {"color-temperature", "colortemp", "colour_temperature"},
+	"brightness":   {"bright"},
+}
+
+func expandPropName(name string) []string {
+	if aliases, ok := propAliases[name]; ok {
+		return append([]string{name}, aliases...)
+	}
+	return []string{name}
+}
+
 func findPropByName(spec *MiotSpec, name string) (siid, piid int, ok bool) {
-	suffix := ":" + name
-	for _, svc := range spec.Services {
-		siid = svc.IID
-		for _, prop := range svc.Properties {
-			if strings.HasSuffix(prop.Type, suffix) {
-				return siid, prop.IID, true
-			}
-			if strings.Contains(prop.Type, ":property:"+name+":") {
-				return siid, prop.IID, true
+	for _, candidate := range expandPropName(name) {
+		suffix := ":" + candidate
+		for _, svc := range spec.Services {
+			siid = svc.IID
+			for _, prop := range svc.Properties {
+				if strings.HasSuffix(prop.Type, suffix) {
+					return siid, prop.IID, true
+				}
+				if strings.Contains(prop.Type, ":property:"+candidate+":") {
+					return siid, prop.IID, true
+				}
 			}
 		}
 	}

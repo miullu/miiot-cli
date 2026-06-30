@@ -185,14 +185,21 @@ async function refresh() {
 
 async function act(name, cmd, val) {
   const opts = { method: 'POST' };
+  var numVal;
   if(val !== undefined) {
     opts.headers = {'Content-Type': 'application/json'};
-    var numVal = parseInt(val);
+    numVal = parseInt(val);
     opts.body = JSON.stringify({ value: isNaN(numVal) ? val : numVal });
   }
   const res = await fetch('/api/devices/' + encodeURIComponent(name) + '/' + cmd, opts);
   if (res.ok) {
     const data = await res.json();
+    // Immediate re-poll after set may return stale data; use what we sent
+    if (!isNaN(numVal)) {
+      if (cmd === 'brightness') data.brightness = numVal;
+      else if (cmd === 'mode') data.mode = numVal;
+      else if (cmd === 'colortemp') data.color_temp = numVal;
+    }
     var el = document.getElementById('card-' + esc(data.name));
     if (el) el.outerHTML = cardHtml(data);
   }

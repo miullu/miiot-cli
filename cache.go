@@ -127,63 +127,124 @@ func fillMiotState(dev *Device, status *deviceStatus, model, did string) {
 			}
 		}
 	}
-
 	if len(params) == 0 {
 		params = []map[string]int{{"siid": 2, "piid": 1}}
 	}
 
-	results, err := miotGetPropertiesBatched(dev, did, params, 15)
-	if err != nil {
-		status.Error = fmt.Sprintf("read failed: %v", err)
-		return
-	}
+	results, batchErr := miotGetPropertiesBatched(dev, did, params, 15)
 
-	status.Props = make(map[string]interface{})
 	status.Power = "UNKNOWN"
+	if batchErr == nil {
+		status.Props = make(map[string]interface{})
+		for _, r := range results {
+			siid, _ := r["siid"].(float64)
+			piid, _ := r["piid"].(float64)
+			code, _ := r["code"].(float64)
+			if code != 0 {
+				continue
+			}
+			val := r["value"]
+			name := findPropName(spec, int(siid), int(piid))
+			if name == "" {
+				name = fmt.Sprintf("%.0f.%.0f", siid, piid)
+			}
+			key := fmt.Sprintf("%d.%d", int(siid), int(piid))
+			status.Props[key] = val
 
-	for _, r := range results {
-		siid, _ := r["siid"].(float64)
-		piid, _ := r["piid"].(float64)
-		code, _ := r["code"].(float64)
-		if code != 0 {
-			continue
-		}
-		val := r["value"]
-		name := findPropName(spec, int(siid), int(piid))
-		if name == "" {
-			name = fmt.Sprintf("%.0f.%.0f", siid, piid)
-		}
-
-		key := fmt.Sprintf("%d.%d", int(siid), int(piid))
-		status.Props[key] = val
-
-		// Map known properties to structured fields
-		switch name {
-		case "on", "power", "switch":
-			if b, ok := val.(bool); ok {
-				if b {
-					status.Power = "ON"
-				} else {
-					status.Power = "OFF"
+			switch name {
+			case "on", "power", "switch":
+				if s := formatPower(val); s != "" {
+					status.Power = s
 				}
-			}
-		case "brightness", "bright", "Brightness":
-			if n, ok := toInt(val); ok {
-				status.Brightness = &n
-				if status.Power == "UNKNOWN" && n > 0 {
-					status.Power = "ON"
+			case "brightness", "bright", "Brightness":
+				if n, ok := toInt(val); ok {
+					status.Brightness = &n
+					if status.Power == "UNKNOWN" && n > 0 {
+						status.Power = "ON"
+					}
 				}
-			}
-		case "color-temperature", "color_temp", "colour_temperature", "ColorTemperature", "cct", "ct":
-			if n, ok := toInt(val); ok {
-				status.ColorTemp = &n
-			}
-		case "snm", "mode", "Scenes", "scene_num", "color_mode":
-			if n, ok := toInt(val); ok {
-				status.Mode = &n
+			case "color-temperature", "color_temp", "colour_temperature", "ColorTemperature", "cct", "ct":
+				if n, ok := toInt(val); ok {
+					status.ColorTemp = &n
+				}
+			case "snm", "mode", "Scenes", "scene_num", "color_mode":
+				if n, ok := toInt(val); ok {
+					status.Mode = &n
+				}
 			}
 		}
 	}
+
+	if status.Power == "UNKNOWN" {
+		status.Power = readPowerFallback(dev, spec, did)
+	}
+	if status.Power == "UNKNOWN" {
+		result, miioErr := miioGetProp(dev, "power")
+		if miioErr == nil && len(result) > 0 {
+			if s, ok := result[0].(string); ok {
+				status.Power = strings.ToUpper(s)
+			}
+		}
+	}
+	if status.Power == "" {
+		status.Power = "UNKNOWN"
+	}
+
+	if batchErr != nil {
+		status.Error = fmt.Sprintf("read failed: %v", batchErr)
+	}
+}
+
+func readPowerFallback(dev *Device, spec *MiotSpec, did string) string {
+	r, err := miotGetProperties(dev, did, []map[string]int{{"siid": 2, "piid": 1}})
+	if err == nil && len(r) > 0 {
+		if code, ok := r[0]["code"].(float64); ok && code == 0 {
+			return formatPower(r[0]["value"])
+		}
+	}
+	for _, svc := range spec.Services {
+		for _, prop := range svc.Properties {
+			if !prop.IsReadable() {
+				continue
+			}
+			name := prop.Type
+			if idx := strings.LastIndex(name, ":"); idx >= 0 {
+				name = name[idx+1:]
+			}
+			switch name {
+			case "on", "power", "switch":
+				r, err := miotGetProperties(dev, did, []map[string]int{{"siid": svc.IID, "piid": prop.IID}})
+				if err == nil && len(r) > 0 {
+					if code, ok := r[0]["code"].(float64); ok && code == 0 {
+						return formatPower(r[0]["value"])
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func formatPower(val interface{}) string {
+	switch v := val.(type) {
+	case bool:
+		if v {
+			return "ON"
+		}
+		return "OFF"
+	case string:
+		s := strings.ToLower(v)
+		if s == "on" || s == "true" || s == "1" {
+			return "ON"
+		}
+		return "OFF"
+	case float64:
+		if v != 0 {
+			return "ON"
+		}
+		return "OFF"
+	}
+	return ""
 }
 
 func fillMiioState(dev *Device, status *deviceStatus, model string) {
@@ -278,11 +339,12 @@ func toInt(v interface{}) (int, bool) {
 	return 0, false
 }
 
-func refreshDeviceCache(entry *DeviceEntry) {
+func refreshDeviceCache(entry *DeviceEntry) *deviceStatus {
 	updated := pollDeviceFullState(entry)
 	globalCache.mu.Lock()
 	globalCache.statuses[entry.Name] = updated
 	globalCache.mu.Unlock()
+	return updated
 }
 
 func StartAutomationEngine() {

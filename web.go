@@ -76,10 +76,10 @@ func apiDeviceAction(name, action string, w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	go refreshDeviceCache(entry)
+	updated := refreshDeviceCache(entry)
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"result": "ok"})
+	json.NewEncoder(w).Encode(updated)
 }
 
 var dashboardTmpl = template.Must(template.New("dashboard").Parse(`<!DOCTYPE html>
@@ -131,51 +131,52 @@ function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
-function toggleRaw(id) {
-  var el = document.getElementById(id);
+function toggleRaw(name) {
+  var el = document.getElementById('raw-' + esc(name));
   if (el) el.style.display = el.style.display === 'block' ? 'none' : 'block';
+}
+
+function cardHtml(d) {
+  var opacity = d.online ? '1' : '0.5';
+  var modelStr = d.model ? d.model : '?';
+  var protoStr = d.protocol ? d.protocol : '?';
+  var briVal = d.brightness !== undefined && d.brightness !== null ? d.brightness : '';
+  var ctVal = d.color_temp !== undefined && d.color_temp !== null ? d.color_temp : '';
+  var modeVal = d.mode !== undefined && d.mode !== null ? d.mode : '';
+
+  var html = '<div class="card" id="card-' + esc(d.name) + '" style="opacity: ' + opacity + '">';
+  html += '  <strong style="font-size:1rem">' + esc(d.name) + '</strong>';
+  html += '  <div class="meta">' + esc(d.host) + ' &bull; ' + esc(modelStr) + ' &bull; ' + esc(protoStr) + '</div>';
+  html += '  <div class="power ' + esc(d.power) + '">' + esc(d.power) + '</div>';
+  html += '  <div class="ctrl">';
+  html += '    <button onclick="act(\'' + esc(d.name) + '\',\'on\')">ON</button>';
+  html += '    <button onclick="act(\'' + esc(d.name) + '\',\'off\')">OFF</button>';
+  html += '  </div>';
+
+  if (d.online) {
+    html += '  <div class="row"><label>Bright</label><input type="range" min="1" max="100" value="' + esc(briVal) + '" onchange="act(\'' + esc(d.name) + '\',\'brightness\',this.value)"><span class="val">' + esc(briVal) + '</span></div>';
+    html += '  <div class="row"><label>Mode</label><input type="range" min="0" max="6" value="' + esc(modeVal) + '" onchange="act(\'' + esc(d.name) + '\',\'mode\',this.value)"><span class="val">' + esc(modeVal) + '</span></div>';
+    html += '  <div class="row"><label>ColorK</label><input type="range" min="2700" max="6500" step="100" value="' + esc(ctVal) + '" onchange="act(\'' + esc(d.name) + '\',\'colortemp\',this.value)"><span class="val">' + esc(ctVal) + '</span></div>';
+    html += '  <div class="raw-toggle" onclick="toggleRaw(\'' + esc(d.name) + '\')">&#9654; Raw properties</div>';
+    html += '  <div class="raw-json" id="raw-' + esc(d.name) + '">' + esc(JSON.stringify(d.props, null, 2)) + '</div>';
+  }
+
+  if (d.error) {
+    html += '  <div class="err">' + esc(d.error) + '</div>';
+  }
+
+  html += '</div>';
+  return html;
 }
 
 async function refresh() {
   try {
     const res = await fetch('/api/devices');
     const data = await res.json();
-
     var htmlContent = '';
     for (var i = 0; i < data.length; i++) {
-      var d = data[i];
-      var opacity = d.online ? '1' : '0.5';
-      var modelStr = d.model ? d.model : '?';
-      var protoStr = d.protocol ? d.protocol : '?';
-
-      var briVal = d.brightness !== undefined && d.brightness !== null ? d.brightness : '';
-      var ctVal = d.color_temp !== undefined && d.color_temp !== null ? d.color_temp : '';
-      var modeVal = d.mode !== undefined && d.mode !== null ? d.mode : '';
-
-      htmlContent += '<div class="card" style="opacity: ' + opacity + '">';
-      htmlContent += '  <strong style="font-size:1rem">' + esc(d.name) + '</strong>';
-      htmlContent += '  <div class="meta">' + esc(d.host) + ' &bull; ' + esc(modelStr) + ' &bull; ' + esc(protoStr) + '</div>';
-      htmlContent += '  <div class="power ' + esc(d.power) + '">' + esc(d.power) + '</div>';
-      htmlContent += '  <div class="ctrl">';
-      htmlContent += '    <button onclick="act(\'' + esc(d.name) + '\',\'on\')">ON</button>';
-      htmlContent += '    <button onclick="act(\'' + esc(d.name) + '\',\'off\')">OFF</button>';
-      htmlContent += '  </div>';
-
-      if (d.online) {
-        htmlContent += '  <div class="row"><label>Bright</label><input type="range" min="1" max="100" value="' + esc(briVal) + '" onchange="act(\'' + esc(d.name) + '\',\'brightness\',this.value)"><span class="val">' + esc(briVal) + '</span></div>';
-        htmlContent += '  <div class="row"><label>Mode</label><input type="range" min="0" max="6" value="' + esc(modeVal) + '" onchange="act(\'' + esc(d.name) + '\',\'mode\',this.value)"><span class="val">' + esc(modeVal) + '</span></div>';
-        htmlContent += '  <div class="row"><label>ColorK</label><input type="range" min="2700" max="6500" step="100" value="' + esc(ctVal) + '" onchange="act(\'' + esc(d.name) + '\',\'colortemp\',this.value)"><span class="val">' + esc(ctVal) + '</span></div>';
-        htmlContent += '  <div class="raw-toggle" onclick="toggleRaw(\'raw-' + i + '\')">&#9654; Raw properties</div>';
-        htmlContent += '  <div class="raw-json" id="raw-' + i + '">' + esc(JSON.stringify(d.props, null, 2)) + '</div>';
-      }
-
-      if (d.error) {
-        htmlContent += '  <div class="err">' + esc(d.error) + '</div>';
-      }
-
-      htmlContent += '</div>';
+      htmlContent += cardHtml(data[i]);
     }
-
     document.getElementById('devs').innerHTML = htmlContent;
   } catch(e) {
     console.error('refresh error:', e);
@@ -189,8 +190,12 @@ async function act(name, cmd, val) {
     var numVal = parseInt(val);
     opts.body = JSON.stringify({ value: isNaN(numVal) ? val : numVal });
   }
-  await fetch('/api/devices/' + encodeURIComponent(name) + '/' + cmd, opts);
-  setTimeout(refresh, 300);
+  const res = await fetch('/api/devices/' + encodeURIComponent(name) + '/' + cmd, opts);
+  if (res.ok) {
+    const data = await res.json();
+    var el = document.getElementById('card-' + esc(data.name));
+    if (el) el.outerHTML = cardHtml(data);
+  }
 }
 
 async function loadSchedule() {
@@ -231,7 +236,6 @@ async function saveSchedule() {
 
 refresh();
 loadSchedule();
-setInterval(refresh, 4000);
 </script>
 </body>
 </html>`))

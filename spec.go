@@ -42,10 +42,19 @@ type MiotService struct {
 }
 
 type MiotProperty struct {
-	IID   int    `json:"iid"`
-	Type  string `json:"type"`
-	Format string `json:"format,omitempty"`
+	IID    int      `json:"iid"`
+	Type   string   `json:"type"`
+	Format string   `json:"format,omitempty"`
 	Access []string `json:"access,omitempty"`
+}
+
+func (p *MiotProperty) IsReadable() bool {
+	for _, a := range p.Access {
+		if a == "read" {
+			return true
+		}
+	}
+	return len(p.Access) == 0
 }
 
 func specCacheDir() string {
@@ -207,10 +216,33 @@ func findLightOnProp(spec *MiotSpec) (siid, piid int, ok bool) {
 	return 0, 0, false
 }
 
+func findPropName(spec *MiotSpec, siid, piid int) string {
+	for _, svc := range spec.Services {
+		if svc.IID != siid {
+			continue
+		}
+		for _, prop := range svc.Properties {
+			if prop.IID == piid {
+				pn := prop.Type
+				if idx := strings.LastIndex(prop.Type, ":"); idx >= 0 {
+					pn = prop.Type[idx+1:]
+				}
+				return pn
+			}
+		}
+	}
+	return ""
+}
+
 var propAliases = map[string][]string{
-	"colortemp":    {"color-temperature", "color_temp", "colour_temperature"},
-	"color_temp":   {"color-temperature", "colortemp", "colour_temperature"},
-	"brightness":   {"bright"},
+	"colortemp":           {"color-temperature", "color_temp", "colour_temperature", "ColorTemperature"},
+	"color_temp":          {"color-temperature", "colortemp", "colour_temperature", "ColorTemperature"},
+	"color-temperature":   {"color_temp", "colortemp", "colour_temperature", "ColorTemperature"},
+	"colour_temperature":  {"color-temperature", "color_temp", "colortemp", "ColorTemperature"},
+	"brightness":          {"bright", "Brightness"},
+	"bright":              {"brightness", "Brightness"},
+	"mode":                {"snm", "Scenes", "scene_num", "color_mode"},
+	"power":               {"on", "pow", "LightPower", "state"},
 }
 
 func expandPropName(name string) []string {

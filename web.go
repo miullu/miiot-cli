@@ -1,245 +1,16 @@
 package main
 
 import (
-	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
-	"net"
 )
-
-type deviceStatus struct {
-	Name     string `json:"name"`
-	Host     string `json:"host"`
-	Online   bool   `json:"online"`
-	Power    string `json:"power"`
-	Model    string `json:"model"`
-	Protocol string `json:"protocol"`
-	Error    string `json:"error,omitempty"`
-}
-
-// cachedMeta remembers structural data so we don't spam miIO.info over UDP
-type cachedMeta struct {
-	model    string
-	did      string
-	protocol string
-}
-
-type ServerCache struct {
-	mu       sync.RWMutex
-	statuses map[string]*deviceStatus
-	metadata map[string]cachedMeta
-}
-
-var globalCache = &ServerCache{
-	statuses: make(map[string]*deviceStatus),
-	metadata: make(map[string]cachedMeta),
-}
-
-// StartBackgroundPoller updates statuses asynchronously every 5 seconds
-func StartBackgroundPoller() {
-	go func() {
-		for {
-			entries, err := LoadDevices()
-			if err == nil {
-				var wg sync.WaitGroup
-				for _, entry := range entries {
-					wg.Add(1)
-					go func(e DeviceEntry) {
-						defer wg.Done()
-						status := fetchDeviceStatusQuick(&e)
-						globalCache.mu.Lock()
-						globalCache.statuses[e.Name] = status
-						globalCache.mu.Unlock()
-					}(entry)
-				}
-				wg.Wait()
-			}
-			time.Sleep(5 * time.Second)
-		}
-	}()
-}
-
-// StartAutomationEngine checks the automation.csv file every 10 seconds and triggers actions
-func StartAutomationEngine() {
-	go func() {
-		var lastProcessedMinute string
-		for {
-			now := time.Now()
-			currentMin := now.Format("15:04") // Format: "HH:MM"
-			currentDate := now.Format("2006-01-02")
-			timeKey := currentMin + "@" + currentDate
-
-			if timeKey != lastProcessedMinute {
-				runScheduledTasks(currentMin)
-				lastProcessedMinute = timeKey
-			}
-			time.Sleep(10 * time.Second)
-		}
-	}()
-}
-
-func runScheduledTasks(currentTime string) {
-	path := filepath.Join(dataDir(), "automation.csv")
-	f, err := os.Open(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// Write a default template so users have a structured starting point
-			_ = os.MkdirAll(dataDir(), 0755)
-			defaultCSV := "time,device,command,value\n" +
-				"# Format: time(HH:MM), deviceName, command, optionalValue\n" +
-				"# Examples:\n" +
-				"# 07:30,lamp,on,\n" +
-				"# 18:00,lamp,brightness,80\n" +
-				"# 23:00,lamp,off,\n"
-			_ = os.WriteFile(path, []byte(defaultCSV), 0644)
-		}
-		return
-	}
-	defer f.Close()
-
-	r := csv.NewReader(f)
-	r.Comment = '#' // Enable comment parsing support
-	r.FieldsPerRecord = -1
-
-	records, err := r.ReadAll()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[Automation] Error reading CSV: %v\n", err)
-		return
-	}
-
-	for i, rec := range records {
-		if i == 0 && len(rec) > 0 && rec[0] == "time" {
-			continue // Skip CSV header
-		}
-		if len(rec) < 3 {
-			continue
-		}
-		taskTime := strings.TrimSpace(rec[0])
-		deviceName := strings.TrimSpace(rec[1])
-		command := strings.TrimSpace(rec[2])
-		var valStr string
-		if len(rec) >= 4 {
-			valStr = strings.TrimSpace(rec[3])
-		}
-
-		if taskTime == currentTime {
-			fmt.Printf("[Automation] [%s] Triggering %s for device: %s (value: %s)\n", taskTime, command, deviceName, valStr)
-			executeScheduledTask(deviceName, command, valStr)
-		}
-	}
-}
-
-func executeScheduledTask(deviceName, command, valStr string) {
-	entry, err := FindDevice(deviceName)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[Automation] Error: Device '%s' not found: %v\n", deviceName, err)
-		return
-	}
-
-	dev, err := newDevice(entry.Host, entry.Token)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "[Automation] Error initializing '%s': %v\n", deviceName, err)
-		return
-	}
-
-	var exitCode int
-	switch command {
-	case "on":
-		exitCode = cmdOn(dev)
-	case "off":
-		exitCode = cmdOff(dev)
-	case "brightness", "mode", "colortemp":
-		exitCode = cmdSetProp(dev, command, valStr, command)
-	default:
-		fmt.Fprintf(os.Stderr, "[Automation] Unsupported schedule command: %s\n", command)
-		return
-	}
-
-	if exitCode != 0 {
-		fmt.Fprintf(os.Stderr, "[Automation] Command failed for '%s'\n", deviceName)
-	} else {
-		fmt.Printf("[Automation] Command successful for '%s'\n", deviceName)
-		// Instantly update dynamic state cache
-		go func() {
-			updated := fetchDeviceStatusQuick(entry)
-			globalCache.mu.Lock()
-			globalCache.statuses[entry.Name] = updated
-			globalCache.mu.Unlock()
-		}()
-	}
-}
-
-func fetchDeviceStatusQuick(entry *DeviceEntry) *deviceStatus {
-	status := &deviceStatus{Name: entry.Name, Host: entry.Host, Power: "UNKNOWN"}
-
-	dev, err := newDevice(entry.Host, entry.Token)
-	if err != nil {
-		status.Error = err.Error()
-		return status
-	}
-
-	globalCache.mu.RLock()
-	meta, hasMeta := globalCache.metadata[entry.Name]
-	globalCache.mu.RUnlock()
-
-	var model, did, proto string
-
-	if hasMeta {
-		model = meta.model
-		did = meta.did
-		proto = meta.protocol
-	} else {
-		// Only perform heavy discovery protocol setup once per lifespan or until success
-		pi, err := getInfo(dev)
-		if err != nil {
-			status.Error = err.Error()
-			return status
-		}
-		model = pi.model
-		did = pi.did
-		proto = detectProtocol(dev, model, did)
-
-		globalCache.mu.Lock()
-		globalCache.metadata[entry.Name] = cachedMeta{model: model, did: did, protocol: proto}
-		globalCache.mu.Unlock()
-	}
-
-	status.Online = true
-	status.Model = model
-	status.Protocol = proto
-
-	// Fast track property evaluation (Mimicking native fast CLI routines)
-	if proto == "miot" {
-		result, err := miotGetProperties(dev, did, []map[string]int{{"siid": 2, "piid": 1}})
-		if err == nil && len(result) > 0 {
-			if code, ok := result[0]["code"].(float64); ok && code == 0 {
-				if val, ok := result[0]["value"].(bool); ok {
-					if val {
-						status.Power = "ON"
-					} else {
-						status.Power = "OFF"
-					}
-				}
-			}
-		}
-	} else if proto == "miio" {
-		result, err := miioGetProp(dev, "power")
-		if err == nil && len(result) > 0 {
-			if s, ok := result[0].(string); ok {
-				status.Power = strings.ToUpper(s)
-			}
-		}
-	}
-
-	return status
-}
 
 func apiDevices(w http.ResponseWriter, r *http.Request) {
 	entries, err := LoadDevices()
@@ -256,8 +27,9 @@ func apiDevices(w http.ResponseWriter, r *http.Request) {
 		if cached, ok := globalCache.statuses[entry.Name]; ok {
 			statuses = append(statuses, cached)
 		} else {
-			// Fallback placeholder if background thread hasn't finished first sweep
-			statuses = append(statuses, &deviceStatus{Name: entry.Name, Host: entry.Host, Power: "LOADING..."})
+			statuses = append(statuses, &deviceStatus{
+				Name: entry.Name, Host: entry.Host, Power: "LOADING...",
+			})
 		}
 	}
 
@@ -304,13 +76,7 @@ func apiDeviceAction(name, action string, w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Trigger immediate state recalculation dynamically for fast UI interaction feedback
-	go func() {
-		updated := fetchDeviceStatusQuick(entry)
-		globalCache.mu.Lock()
-		globalCache.statuses[entry.Name] = updated
-		globalCache.mu.Unlock()
-	}()
+	go refreshDeviceCache(entry)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"result": "ok"})
@@ -325,7 +91,7 @@ var dashboardTmpl = template.Must(template.New("dashboard").Parse(`<!DOCTYPE htm
   body { font-family: sans-serif; background: #121214; color: #e1e1e6; padding: 20px; margin: 0; }
   h1 { font-size: 1.4rem; color: #9b67ef; margin-top: 25px; }
   h1:first-of-type { margin-top: 0; }
-  .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); margin-top: 15px; }
+  .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); margin-top: 15px; }
   .card { background: #202024; padding: 15px; border-radius: 8px; border: 1px solid #323238; }
   .meta { font-size: 0.8rem; color: #7c7c8a; margin: 4px 0 10px 0; }
   .power { font-weight: bold; font-size: 1.1rem; margin-bottom: 12px; }
@@ -334,8 +100,13 @@ var dashboardTmpl = template.Must(template.New("dashboard").Parse(`<!DOCTYPE htm
   button { background: #4e4e54; color: #fff; border: 0; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
   button:hover { background: #62626a; }
   .row { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 0.8rem; color: #8d8d99; }
-  input { flex: 1; accent-color: #9b67ef; }
+  .row label { min-width: 60px; }
+  .row .val { min-width: 40px; text-align: right; color: #e1e1e6; }
+  input[type=range] { flex: 1; accent-color: #9b67ef; }
   .err { color: #f75a68; font-size: 0.8rem; margin-top: 5px; }
+  .raw-toggle { font-size: 0.75rem; color: #7c7c8a; cursor: pointer; margin-top: 6px; }
+  .raw-toggle:hover { color: #9b67ef; }
+  .raw-json { display: none; font-size: 0.7rem; color: #7c7c8a; margin-top: 6px; background: #121214; padding: 8px; border-radius: 4px; max-height: 200px; overflow: auto; white-space: pre-wrap; }
   textarea { width: 100%; height: 180px; font-family: monospace; background: #121214; color: #e1e1e6; border: 1px solid #323238; border-radius: 4px; padding: 10px; box-sizing: border-box; resize: vertical; margin-bottom: 12px; }
 </style>
 </head>
@@ -360,53 +131,66 @@ function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 
+function toggleRaw(id) {
+  var el = document.getElementById(id);
+  if (el) el.style.display = el.style.display === 'block' ? 'none' : 'block';
+}
+
 async function refresh() {
   try {
     const res = await fetch('/api/devices');
     const data = await res.json();
-    
+
     var htmlContent = '';
     for (var i = 0; i < data.length; i++) {
       var d = data[i];
       var opacity = d.online ? '1' : '0.5';
       var modelStr = d.model ? d.model : '?';
       var protoStr = d.protocol ? d.protocol : '?';
-      var powerStr = d.power ? d.power : 'UNKNOWN';
-      
+
+      var briVal = d.brightness !== undefined && d.brightness !== null ? d.brightness : '';
+      var ctVal = d.color_temp !== undefined && d.color_temp !== null ? d.color_temp : '';
+      var modeVal = d.mode !== undefined && d.mode !== null ? d.mode : '';
+
       htmlContent += '<div class="card" style="opacity: ' + opacity + '">';
       htmlContent += '  <strong style="font-size:1rem">' + esc(d.name) + '</strong>';
       htmlContent += '  <div class="meta">' + esc(d.host) + ' &bull; ' + esc(modelStr) + ' &bull; ' + esc(protoStr) + '</div>';
-      htmlContent += '  <div class="power ' + esc(powerStr) + '">' + esc(powerStr) + '</div>';
+      htmlContent += '  <div class="power ' + esc(d.power) + '">' + esc(d.power) + '</div>';
       htmlContent += '  <div class="ctrl">';
       htmlContent += '    <button onclick="act(\'' + esc(d.name) + '\',\'on\')">ON</button>';
       htmlContent += '    <button onclick="act(\'' + esc(d.name) + '\',\'off\')">OFF</button>';
       htmlContent += '  </div>';
-      
+
       if (d.online) {
-        htmlContent += '  <div class="row"><label>Bright</label><input type="range" min="1" max="100" onchange="act(\'' + esc(d.name) + '\',\'brightness\',this.value)"></div>';
-        htmlContent += '  <div class="row"><label>Mode</label><input type="range" min="0" max="3" onchange="act(\'' + esc(d.name) + '\',\'mode\',this.value)"></div>';
-        htmlContent += '  <div class="row"><label>ColorK</label><input type="range" min="2700" max="6500" step="100" onchange="act(\'' + esc(d.name) + '\',\'colortemp\',this.value)"></div>';
+        htmlContent += '  <div class="row"><label>Bright</label><input type="range" min="1" max="100" value="' + esc(briVal) + '" onchange="act(\'' + esc(d.name) + '\',\'brightness\',this.value)"><span class="val">' + esc(briVal) + '</span></div>';
+        htmlContent += '  <div class="row"><label>Mode</label><input type="range" min="0" max="6" value="' + esc(modeVal) + '" onchange="act(\'' + esc(d.name) + '\',\'mode\',this.value)"><span class="val">' + esc(modeVal) + '</span></div>';
+        htmlContent += '  <div class="row"><label>ColorK</label><input type="range" min="2700" max="6500" step="100" value="' + esc(ctVal) + '" onchange="act(\'' + esc(d.name) + '\',\'colortemp\',this.value)"><span class="val">' + esc(ctVal) + '</span></div>';
+        htmlContent += '  <div class="raw-toggle" onclick="toggleRaw(\'raw-' + i + '\')">&#9654; Raw properties</div>';
+        htmlContent += '  <div class="raw-json" id="raw-' + i + '">' + esc(JSON.stringify(d.props, null, 2)) + '</div>';
       }
-      
+
       if (d.error) {
         htmlContent += '  <div class="err">' + esc(d.error) + '</div>';
       }
-      
+
       htmlContent += '</div>';
     }
-    
+
     document.getElementById('devs').innerHTML = htmlContent;
-  } catch(e) {}
+  } catch(e) {
+    console.error('refresh error:', e);
+  }
 }
 
 async function act(name, cmd, val) {
   const opts = { method: 'POST' };
   if(val !== undefined) {
     opts.headers = {'Content-Type': 'application/json'};
-    opts.body = JSON.stringify({ value: window.isNaN(val) ? val : parseInt(val) });
+    var numVal = parseInt(val);
+    opts.body = JSON.stringify({ value: isNaN(numVal) ? val : numVal });
   }
   await fetch('/api/devices/' + encodeURIComponent(name) + '/' + cmd, opts);
-  setTimeout(refresh, 200);
+  setTimeout(refresh, 300);
 }
 
 async function loadSchedule() {
@@ -453,7 +237,6 @@ setInterval(refresh, 4000);
 </html>`))
 
 func serveWeb(listenAddr string) error {
-	// Initialize and run background optimization and automation loops
 	StartBackgroundPoller()
 	StartAutomationEngine()
 
@@ -536,36 +319,26 @@ func serveWeb(listenAddr string) error {
 		dashboardTmpl.Execute(w, nil)
 	})
 
-	// Parse the network type and address
 	var network, address string
 	if strings.HasPrefix(listenAddr, "unix://") {
 		network = "unix"
 		address = strings.TrimPrefix(listenAddr, "unix://")
-
-		// Remove any trailing colon configurations (like :544) if accidental,
-		// since unix sockets use file paths, not ports.
 		if idx := strings.Index(address, ":"); idx != -1 {
-			// Optional: keeping only the path portion if your setup appends a port
 			address = address[:idx]
 		}
-
-		// Clean up existing socket file if it wasn't gracefully closed last time
 		_ = os.Remove(address)
 	} else {
 		network = "tcp"
 		address = listenAddr
-		// Strip http:// prefix if a user accidentally passes it
 		address = strings.TrimPrefix(address, "http://")
 	}
 
-	// Create our abstract network listener
 	listener, err := net.Listen(network, address)
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s (%s): %w", network, address, err)
 	}
 	defer listener.Close()
 
-	// If using unix socket, ensure proper file permissions so web servers/proxies can access it
 	if network == "unix" {
 		_ = os.Chmod(address, 0666)
 	}

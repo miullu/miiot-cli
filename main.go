@@ -573,7 +573,7 @@ Usage:
   miiot-cli <name> brightness <val>       - Set brightness (0-100)
   miiot-cli <name> mode <val>             - Set mode (e.g. 0=day,1=night)
   miiot-cli <name> colortemp <val>        - Set color temperature (kelvin)
-  miiot-cli serve [--port <port>]         - Start web dashboard (default :8080)
+  miiot-cli serve [--listen <addr+port>]  - Start web dashboard (default :8080)
 
 Legacy (direct IP/token, no CSV):
   miiot-cli <host> <token> <command> [args...]
@@ -659,7 +659,7 @@ func main() {
 	case "serve":
 		port := ":8080"
 		for i, arg := range cleanArgs {
-			if arg == "--port" && i+1 < len(cleanArgs) {
+			if arg == "--listen" && i+1 < len(cleanArgs) {
 				port = ":" + cleanArgs[i+1]
 			}
 		}

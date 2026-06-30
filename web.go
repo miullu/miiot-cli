@@ -1,13 +1,17 @@
 package main
 
 import (
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"html/template"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
+	"net"
 )
 
 type deviceStatus struct {
@@ -20,8 +24,160 @@ type deviceStatus struct {
 	Error    string `json:"error,omitempty"`
 }
 
-func getDeviceStatus(entry *DeviceEntry) *deviceStatus {
-	status := &deviceStatus{Name: entry.Name, Host: entry.Host}
+// cachedMeta remembers structural data so we don't spam miIO.info over UDP
+type cachedMeta struct {
+	model    string
+	did      string
+	protocol string
+}
+
+type ServerCache struct {
+	mu       sync.RWMutex
+	statuses map[string]*deviceStatus
+	metadata map[string]cachedMeta
+}
+
+var globalCache = &ServerCache{
+	statuses: make(map[string]*deviceStatus),
+	metadata: make(map[string]cachedMeta),
+}
+
+// StartBackgroundPoller updates statuses asynchronously every 5 seconds
+func StartBackgroundPoller() {
+	go func() {
+		for {
+			entries, err := LoadDevices()
+			if err == nil {
+				var wg sync.WaitGroup
+				for _, entry := range entries {
+					wg.Add(1)
+					go func(e DeviceEntry) {
+						defer wg.Done()
+						status := fetchDeviceStatusQuick(&e)
+						globalCache.mu.Lock()
+						globalCache.statuses[e.Name] = status
+						globalCache.mu.Unlock()
+					}(entry)
+				}
+				wg.Wait()
+			}
+			time.Sleep(5 * time.Second)
+		}
+	}()
+}
+
+// StartAutomationEngine checks the automation.csv file every 10 seconds and triggers actions
+func StartAutomationEngine() {
+	go func() {
+		var lastProcessedMinute string
+		for {
+			now := time.Now()
+			currentMin := now.Format("15:04") // Format: "HH:MM"
+			currentDate := now.Format("2006-01-02")
+			timeKey := currentMin + "@" + currentDate
+
+			if timeKey != lastProcessedMinute {
+				runScheduledTasks(currentMin)
+				lastProcessedMinute = timeKey
+			}
+			time.Sleep(10 * time.Second)
+		}
+	}()
+}
+
+func runScheduledTasks(currentTime string) {
+	path := filepath.Join(dataDir(), "automation.csv")
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Write a default template so users have a structured starting point
+			_ = os.MkdirAll(dataDir(), 0755)
+			defaultCSV := "time,device,command,value\n" +
+				"# Format: time(HH:MM), deviceName, command, optionalValue\n" +
+				"# Examples:\n" +
+				"# 07:30,lamp,on,\n" +
+				"# 18:00,lamp,brightness,80\n" +
+				"# 23:00,lamp,off,\n"
+			_ = os.WriteFile(path, []byte(defaultCSV), 0644)
+		}
+		return
+	}
+	defer f.Close()
+
+	r := csv.NewReader(f)
+	r.Comment = '#' // Enable comment parsing support
+	r.FieldsPerRecord = -1
+
+	records, err := r.ReadAll()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[Automation] Error reading CSV: %v\n", err)
+		return
+	}
+
+	for i, rec := range records {
+		if i == 0 && len(rec) > 0 && rec[0] == "time" {
+			continue // Skip CSV header
+		}
+		if len(rec) < 3 {
+			continue
+		}
+		taskTime := strings.TrimSpace(rec[0])
+		deviceName := strings.TrimSpace(rec[1])
+		command := strings.TrimSpace(rec[2])
+		var valStr string
+		if len(rec) >= 4 {
+			valStr = strings.TrimSpace(rec[3])
+		}
+
+		if taskTime == currentTime {
+			fmt.Printf("[Automation] [%s] Triggering %s for device: %s (value: %s)\n", taskTime, command, deviceName, valStr)
+			executeScheduledTask(deviceName, command, valStr)
+		}
+	}
+}
+
+func executeScheduledTask(deviceName, command, valStr string) {
+	entry, err := FindDevice(deviceName)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[Automation] Error: Device '%s' not found: %v\n", deviceName, err)
+		return
+	}
+
+	dev, err := newDevice(entry.Host, entry.Token)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[Automation] Error initializing '%s': %v\n", deviceName, err)
+		return
+	}
+
+	var exitCode int
+	switch command {
+	case "on":
+		exitCode = cmdOn(dev)
+	case "off":
+		exitCode = cmdOff(dev)
+	case "brightness", "mode", "colortemp":
+		exitCode = cmdSetProp(dev, command, valStr, command)
+	default:
+		fmt.Fprintf(os.Stderr, "[Automation] Unsupported schedule command: %s\n", command)
+		return
+	}
+
+	if exitCode != 0 {
+		fmt.Fprintf(os.Stderr, "[Automation] Command failed for '%s'\n", deviceName)
+	} else {
+		fmt.Printf("[Automation] Command successful for '%s'\n", deviceName)
+		// Instantly update dynamic state cache
+		go func() {
+			updated := fetchDeviceStatusQuick(entry)
+			globalCache.mu.Lock()
+			globalCache.statuses[entry.Name] = updated
+			globalCache.mu.Unlock()
+		}()
+	}
+}
+
+func fetchDeviceStatusQuick(entry *DeviceEntry) *deviceStatus {
+	status := &deviceStatus{Name: entry.Name, Host: entry.Host, Power: "UNKNOWN"}
 
 	dev, err := newDevice(entry.Host, entry.Token)
 	if err != nil {
@@ -29,19 +185,39 @@ func getDeviceStatus(entry *DeviceEntry) *deviceStatus {
 		return status
 	}
 
-	pi, err := getInfo(dev)
-	if err != nil {
-		status.Error = err.Error()
-		return status
-	}
-	status.Online = true
-	status.Model = pi.model
+	globalCache.mu.RLock()
+	meta, hasMeta := globalCache.metadata[entry.Name]
+	globalCache.mu.RUnlock()
 
-	proto := detectProtocol(dev, pi.model, pi.did)
+	var model, did, proto string
+
+	if hasMeta {
+		model = meta.model
+		did = meta.did
+		proto = meta.protocol
+	} else {
+		// Only perform heavy discovery protocol setup once per lifespan or until success
+		pi, err := getInfo(dev)
+		if err != nil {
+			status.Error = err.Error()
+			return status
+		}
+		model = pi.model
+		did = pi.did
+		proto = detectProtocol(dev, model, did)
+
+		globalCache.mu.Lock()
+		globalCache.metadata[entry.Name] = cachedMeta{model: model, did: did, protocol: proto}
+		globalCache.mu.Unlock()
+	}
+
+	status.Online = true
+	status.Model = model
 	status.Protocol = proto
 
+	// Fast track property evaluation (Mimicking native fast CLI routines)
 	if proto == "miot" {
-		result, err := miotGetProperties(dev, pi.did, []map[string]int{{"siid": 2, "piid": 1}})
+		result, err := miotGetProperties(dev, did, []map[string]int{{"siid": 2, "piid": 1}})
 		if err == nil && len(result) > 0 {
 			if code, ok := result[0]["code"].(float64); ok && code == 0 {
 				if val, ok := result[0]["value"].(bool); ok {
@@ -62,10 +238,6 @@ func getDeviceStatus(entry *DeviceEntry) *deviceStatus {
 		}
 	}
 
-	if status.Power == "" {
-		status.Power = "UNKNOWN"
-	}
-
 	return status
 }
 
@@ -76,9 +248,17 @@ func apiDevices(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	globalCache.mu.RLock()
+	defer globalCache.mu.RUnlock()
+
 	statuses := make([]*deviceStatus, 0)
 	for _, entry := range entries {
-		statuses = append(statuses, getDeviceStatus(&entry))
+		if cached, ok := globalCache.statuses[entry.Name]; ok {
+			statuses = append(statuses, cached)
+		} else {
+			// Fallback placeholder if background thread hasn't finished first sweep
+			statuses = append(statuses, &deviceStatus{Name: entry.Name, Host: entry.Host, Power: "LOADING..."})
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -98,175 +278,185 @@ func apiDeviceAction(name, action string, w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	var result string
+	var exitCode int
 	switch action {
 	case "on":
-		exitCode := cmdOn(dev)
-		if exitCode == 0 {
-			result = "ok"
-		} else {
-			http.Error(w, "failed to turn on", http.StatusInternalServerError)
-			return
-		}
+		exitCode = cmdOn(dev)
 	case "off":
-		exitCode := cmdOff(dev)
-		if exitCode == 0 {
-			result = "ok"
-		} else {
-			http.Error(w, "failed to turn off", http.StatusInternalServerError)
-			return
-		}
-	case "brightness":
+		exitCode = cmdOff(dev)
+	case "brightness", "mode", "colortemp":
 		var body struct {
-			Value int `json:"value"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, "invalid JSON body", http.StatusBadRequest)
-			return
-		}
-		exitCode := cmdBrightness(dev, fmt.Sprint(body.Value))
-		if exitCode == 0 {
-			result = "ok"
-		} else {
-			http.Error(w, "failed to set brightness", http.StatusInternalServerError)
-			return
-		}
-	case "set":
-		var body struct {
-			Property string      `json:"property"`
-			Value    interface{} `json:"value"`
+			Value interface{} `json:"value"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "invalid JSON body", http.StatusBadRequest)
 			return
 		}
 		strVal := fmt.Sprint(body.Value)
-		exitCode := cmdSetProp(dev, body.Property, strVal, body.Property)
-		if exitCode == 0 {
-			result = "ok"
-		} else {
-			http.Error(w, "failed to set property", http.StatusInternalServerError)
-			return
-		}
+		exitCode = cmdSetProp(dev, action, strVal, action)
 	default:
 		http.Error(w, "unknown action", http.StatusBadRequest)
 		return
 	}
 
+	if exitCode != 0 {
+		http.Error(w, "failed to execute action: "+action, http.StatusInternalServerError)
+		return
+	}
+
+	// Trigger immediate state recalculation dynamically for fast UI interaction feedback
+	go func() {
+		updated := fetchDeviceStatusQuick(entry)
+		globalCache.mu.Lock()
+		globalCache.statuses[entry.Name] = updated
+		globalCache.mu.Unlock()
+	}()
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"result": result})
+	json.NewEncoder(w).Encode(map[string]string{"result": "ok"})
 }
 
 var dashboardTmpl = template.Must(template.New("dashboard").Parse(`<!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>miiot-cli Dashboard</title>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Dashboard</title>
 <style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    background: #1a1a2e; color: #e0e0e0; padding: 20px;
-  }
-  h1 { font-size: 1.5rem; margin-bottom: 20px; color: #b388ff; }
-  .devices { display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); }
-  .card {
-    background: #16213e; border-radius: 12px; padding: 20px;
-    border: 1px solid #2a2a4a; transition: border-color .2s;
-  }
-  .card.online { border-color: #4caf50; }
-  .card.offline { border-color: #f44336; opacity: .6; }
-  .card h2 { font-size: 1.1rem; margin-bottom: 8px; }
-  .card .meta { font-size: .85rem; color: #999; margin-bottom: 12px; }
-  .card .meta span { margin-right: 12px; }
-  .card .power { font-weight: bold; font-size: 1.2rem; margin-bottom: 12px; }
-  .power.on { color: #4caf50; }
-  .power.off { color: #f44336; }
-  .power.unknown { color: #ff9800; }
-  .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-  button {
-    padding: 8px 20px; border: none; border-radius: 6px; cursor: pointer;
-    font-size: .9rem; font-weight: 600; transition: opacity .2s;
-  }
-  button:hover { opacity: .8; }
-  .btn-on { background: #4caf50; color: #fff; }
-  .btn-off { background: #f44336; color: #fff; }
-  .btn-on:disabled, .btn-off:disabled { opacity: .4; cursor: not-allowed; }
-  .slider-group { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
-  .slider-group label { font-size: .85rem; color: #999; }
-  input[type=range] { flex: 1; accent-color: #b388ff; }
-  .slider-value { font-size: .85rem; color: #b388ff; min-width: 30px; text-align: right; }
-  .loading { text-align: center; padding: 40px; color: #666; }
-  .error { color: #f44336; font-size: .85rem; margin-top: 4px; }
-  .footer { margin-top: 24px; text-align: center; font-size: .8rem; color: #555; }
-  .footer a { color: #b388ff; text-decoration: none; }
+  body { font-family: sans-serif; background: #121214; color: #e1e1e6; padding: 20px; margin: 0; }
+  h1 { font-size: 1.4rem; color: #9b67ef; margin-top: 25px; }
+  h1:first-of-type { margin-top: 0; }
+  .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); margin-top: 15px; }
+  .card { background: #202024; padding: 15px; border-radius: 8px; border: 1px solid #323238; }
+  .meta { font-size: 0.8rem; color: #7c7c8a; margin: 4px 0 10px 0; }
+  .power { font-weight: bold; font-size: 1.1rem; margin-bottom: 12px; }
+  .ON { color: #04d361; } .OFF { color: #f75a68; }
+  .ctrl { display: flex; gap: 6px; margin-bottom: 10px; }
+  button { background: #4e4e54; color: #fff; border: 0; padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 0.85rem; }
+  button:hover { background: #62626a; }
+  .row { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 0.8rem; color: #8d8d99; }
+  input { flex: 1; accent-color: #9b67ef; }
+  .err { color: #f75a68; font-size: 0.8rem; margin-top: 5px; }
+  textarea { width: 100%; height: 180px; font-family: monospace; background: #121214; color: #e1e1e6; border: 1px solid #323238; border-radius: 4px; padding: 10px; box-sizing: border-box; resize: vertical; margin-bottom: 12px; }
 </style>
 </head>
 <body>
-<h1>miiot-cli Dashboard</h1>
-<div class="devices" id="devices"><div class="loading">Loading...</div></div>
-<div class="footer">miiot-cli &mdash; <a href="#" onclick="refresh()">refresh</a></div>
+  <h1>Devices</h1>
+  <div class="grid" id="devs">Loading...</div>
+
+  <h1>Automation Schedule</h1>
+  <div class="card" style="margin-top: 15px; max-width: 650px;">
+    <div class="meta">Manage periodic events (Format: time,device,command,value). Lines starting with # are ignored.</div>
+    <textarea id="csvText" placeholder="time,device,command,value"></textarea>
+    <div style="display: flex; gap: 10px; align-items: center;">
+      <button onclick="saveSchedule()" id="saveBtn">Save Schedule</button>
+      <button onclick="loadSchedule()">Reload</button>
+      <span id="statusMsg" style="font-size: 0.85rem;"></span>
+    </div>
+  </div>
+
 <script>
-const $ = s => document.querySelector(s);
-const $$ = s => document.querySelectorAll(s);
-
-async function refresh() {
-  const container = document.getElementById('devices');
-  try {
-    const res = await fetch('/api/devices');
-    const devices = await res.json();
-    if (!devices.length) {
-      container.innerHTML = '<div class="card"><h2>No devices</h2><p>Add devices via CLI: miiot-cli add &lt;name&gt; &lt;host&gt; &lt;token&gt;</p></div>';
-      return;
-    }
-    container.innerHTML = devices.map(d => renderCard(d)).join('');
-  } catch (e) {
-    container.innerHTML = '<div class="card error">Failed to load devices</div>';
-  }
-}
-
-function renderCard(d) {
-  const cls = d.online ? 'online' : 'offline';
-  const powerCls = (d.power || '').toLowerCase();
-  return '<div class="card ' + cls + '">' +
-    '<h2>' + esc(d.name) + '</h2>' +
-    '<div class="meta"><span>' + esc(d.host) + '</span><span>' + esc(d.model || '?') + '</span><span>' + esc(d.protocol || '?') + '</span></div>' +
-    '<div class="power ' + powerCls + '">' + esc(d.power || 'UNKNOWN') + '</div>' +
-    '<div class="actions">' +
-      '<button class="btn-on" onclick="action(\'' + d.name + '\',\'on\')" ' + (!d.online ? 'disabled' : '') + '>ON</button>' +
-      '<button class="btn-off" onclick="action(\'' + d.name + '\',\'off\')" ' + (!d.online ? 'disabled' : '') + '>OFF</button>' +
-    '</div>' +
-    (d.online ? '<div class="slider-group"><label>Brightness</label><input type="range" min="0" max="100" value="50" oninput="this.nextElementSibling.textContent=this.value" onchange="action(\'' + d.name + '\',\'brightness\',this.value)"><span class="slider-value">50</span></div>' : '') +
-    (d.error ? '<div class="error">' + esc(d.error) + '</div>' : '') +
-  '</div>';
-}
-
-async function action(name, cmd, value) {
-  const url = '/api/devices/' + encodeURIComponent(name) + '/' + cmd;
-  const opts = { method: 'POST' };
-  if (value !== undefined) {
-    opts.headers = { 'Content-Type': 'application/json' };
-    opts.body = JSON.stringify({ value: parseInt(value) });
-  }
-  try {
-    await fetch(url, opts);
-    setTimeout(refresh, 500);
-  } catch (e) {}
-}
-
 function esc(s) {
   if (!s) return '';
-  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+async function refresh() {
+  try {
+    const res = await fetch('/api/devices');
+    const data = await res.json();
+    
+    var htmlContent = '';
+    for (var i = 0; i < data.length; i++) {
+      var d = data[i];
+      var opacity = d.online ? '1' : '0.5';
+      var modelStr = d.model ? d.model : '?';
+      var protoStr = d.protocol ? d.protocol : '?';
+      var powerStr = d.power ? d.power : 'UNKNOWN';
+      
+      htmlContent += '<div class="card" style="opacity: ' + opacity + '">';
+      htmlContent += '  <strong style="font-size:1rem">' + esc(d.name) + '</strong>';
+      htmlContent += '  <div class="meta">' + esc(d.host) + ' &bull; ' + esc(modelStr) + ' &bull; ' + esc(protoStr) + '</div>';
+      htmlContent += '  <div class="power ' + esc(powerStr) + '">' + esc(powerStr) + '</div>';
+      htmlContent += '  <div class="ctrl">';
+      htmlContent += '    <button onclick="act(\'' + esc(d.name) + '\',\'on\')">ON</button>';
+      htmlContent += '    <button onclick="act(\'' + esc(d.name) + '\',\'off\')">OFF</button>';
+      htmlContent += '  </div>';
+      
+      if (d.online) {
+        htmlContent += '  <div class="row"><label>Bright</label><input type="range" min="1" max="100" onchange="act(\'' + esc(d.name) + '\',\'brightness\',this.value)"></div>';
+        htmlContent += '  <div class="row"><label>Mode</label><input type="range" min="0" max="3" onchange="act(\'' + esc(d.name) + '\',\'mode\',this.value)"></div>';
+        htmlContent += '  <div class="row"><label>ColorK</label><input type="range" min="2700" max="6500" step="100" onchange="act(\'' + esc(d.name) + '\',\'colortemp\',this.value)"></div>';
+      }
+      
+      if (d.error) {
+        htmlContent += '  <div class="err">' + esc(d.error) + '</div>';
+      }
+      
+      htmlContent += '</div>';
+    }
+    
+    document.getElementById('devs').innerHTML = htmlContent;
+  } catch(e) {}
+}
+
+async function act(name, cmd, val) {
+  const opts = { method: 'POST' };
+  if(val !== undefined) {
+    opts.headers = {'Content-Type': 'application/json'};
+    opts.body = JSON.stringify({ value: window.isNaN(val) ? val : parseInt(val) });
+  }
+  await fetch('/api/devices/' + encodeURIComponent(name) + '/' + cmd, opts);
+  setTimeout(refresh, 200);
+}
+
+async function loadSchedule() {
+  try {
+    const res = await fetch('/api/automation');
+    const txt = await res.text();
+    document.getElementById('csvText').value = txt;
+  } catch(e) {}
+}
+
+async function saveSchedule() {
+  const btn = document.getElementById('saveBtn');
+  const msg = document.getElementById('statusMsg');
+  btn.disabled = true;
+  msg.textContent = 'Saving...';
+  msg.style.color = '#7c7c8a';
+  try {
+    const csv = document.getElementById('csvText').value;
+    const res = await fetch('/api/automation', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ csv: csv })
+    });
+    if (res.ok) {
+      msg.textContent = 'Saved successfully!';
+      msg.style.color = '#04d361';
+    } else {
+      msg.textContent = 'Failed to save!';
+      msg.style.color = '#f75a68';
+    }
+  } catch(e) {
+    msg.textContent = 'Error occurred!';
+    msg.style.color = '#f75a68';
+  }
+  btn.disabled = false;
+  setTimeout(() => { msg.textContent = ''; }, 3000);
 }
 
 refresh();
-setInterval(refresh, 5000);
+loadSchedule();
+setInterval(refresh, 4000);
 </script>
 </body>
 </html>`))
 
-func serveWeb(port string) error {
+func serveWeb(listenAddr string) error {
+	// Initialize and run background optimization and automation loops
+	StartBackgroundPoller()
+	StartAutomationEngine()
+
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/api/devices", func(w http.ResponseWriter, r *http.Request) {
@@ -284,15 +474,53 @@ func serveWeb(port string) error {
 			http.Error(w, "invalid path", http.StatusBadRequest)
 			return
 		}
-		name := parts[0]
-		action := parts[1]
-
 		if r.Method != "POST" {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+		apiDeviceAction(parts[0], parts[1], w, r)
+	})
 
-		apiDeviceAction(name, action, w, r)
+	mux.HandleFunc("/api/automation", func(w http.ResponseWriter, r *http.Request) {
+		path := filepath.Join(dataDir(), "automation.csv")
+		if r.Method == "GET" {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				if os.IsNotExist(err) {
+					defaultCSV := "time,device,command,value\n" +
+						"# Format: time(HH:MM), deviceName, command, optionalValue\n" +
+						"# Examples:\n" +
+						"# 07:30,lamp,on,\n" +
+						"# 18:00,lamp,brightness,80\n" +
+						"# 23:00,lamp,off,\n"
+					_ = os.MkdirAll(dataDir(), 0755)
+					_ = os.WriteFile(path, []byte(defaultCSV), 0644)
+					w.Header().Set("Content-Type", "text/plain")
+					w.Write([]byte(defaultCSV))
+					return
+				}
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "text/plain")
+			w.Write(data)
+		} else if r.Method == "POST" {
+			var body struct {
+				CSV string `json:"csv"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, "invalid JSON", http.StatusBadRequest)
+				return
+			}
+			if err := os.WriteFile(path, []byte(body.CSV), 0644); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]string{"result": "ok"})
+		} else {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
 	})
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -308,12 +536,46 @@ func serveWeb(port string) error {
 		dashboardTmpl.Execute(w, nil)
 	})
 
+	// Parse the network type and address
+	var network, address string
+	if strings.HasPrefix(listenAddr, "unix://") {
+		network = "unix"
+		address = strings.TrimPrefix(listenAddr, "unix://")
+
+		// Remove any trailing colon configurations (like :544) if accidental,
+		// since unix sockets use file paths, not ports.
+		if idx := strings.Index(address, ":"); idx != -1 {
+			// Optional: keeping only the path portion if your setup appends a port
+			address = address[:idx]
+		}
+
+		// Clean up existing socket file if it wasn't gracefully closed last time
+		_ = os.Remove(address)
+	} else {
+		network = "tcp"
+		address = listenAddr
+		// Strip http:// prefix if a user accidentally passes it
+		address = strings.TrimPrefix(address, "http://")
+	}
+
+	// Create our abstract network listener
+	listener, err := net.Listen(network, address)
+	if err != nil {
+		return fmt.Errorf("failed to listen on %s (%s): %w", network, address, err)
+	}
+	defer listener.Close()
+
+	// If using unix socket, ensure proper file permissions so web servers/proxies can access it
+	if network == "unix" {
+		_ = os.Chmod(address, 0666)
+	}
+
 	server := &http.Server{
-		Addr:         port,
 		Handler:      mux,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 30 * time.Second,
 	}
 
-	return server.ListenAndServe()
+	fmt.Printf("[Server] Listening on %s://%s\n", network, address)
+	return server.Serve(listener)
 }
